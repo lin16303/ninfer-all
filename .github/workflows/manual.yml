@@ -1,0 +1,213 @@
+# 在 GitHub Actions 的 Windows 运行器上编译 ninfer-all（sm_86 / sm_89）。
+#
+# 三个不做成"默认"的地方，都是踩过才知道的：
+#
+#   1. 运行器锁死 windows-2022，不用 windows-latest。
+#      windows-latest 现在指向 Windows Server 2025，而且 GitHub 已经提供
+#      windows-2025-vs2026 变体。CUDA 12.8/12.9 的 host_config.h 只接受
+#      _MSC_VER 1910-1949（VS 2017 ~ VS 2022 的 v143）；VS 2026 的 MSVC 14.5x
+#      是 _MSC_VER 1950，会被直接拒掉：
+#        C1189: #error: -- unsupported Microsoft Visual Studio version!
+#      而且 nvcc 只认 PATH 上第一个 cl.exe，所以光"装了 VS 2022"不够，
+#      第 5 步必须把它导进当前进程的环境。
+#
+#   2. 依赖走 VCPKG_ROOT + VCPKG_TARGET_TRIPLET，不用 vcpkg toolchain file。
+#      仓库里其实没有 vcpkg.json（只有 docs/build-windows.md 提到它），而
+#      cmake/Dependencies.cmake 在 WIN32 下对 FFMPEG 和 CURL 都是 REQUIRED：
+#        find_package(FFMPEG REQUIRED)   # avformat avcodec avutil swscale
+#        find_package(CURL 7.85 REQUIRED)
+#      走环境变量这条路，cmake/FindFFMPEG.cmake 会把 vcpkg triplet 树里的
+#      这四个 .lib 组装出来，并由 ninfer_stage_runtime_dlls() 把
+#      <triplet>/bin/*.dll 拷到每个 exe 旁边 —— 这是仓库自带
+#      scripts/build-native.bat 用的路径，也是唯一帮你处理 DLL 的路径。
+#      换成 vcpkg toolchain file 就绕开了这段，DLL 得靠 vcpkg 自己的
+#      applocal 机制，产物能不能跑全看运气。
+#
+#   3. FFmpeg 用最小 feature 集。默认会带上 avdevice / avfilter / swresample，
+#      这里全部关掉，只保留项目真正链接的四个库，编译时间能省掉一大截。
+
+name: ninfer-windows-cuda
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'CMAKE_CUDA_ARCHITECTURES（89 = RTX 40 系，86 = RTX 30 系）'
+        required: true
+        default: '89'
+        type: choice
+        options: ['89', '86']
+      targets:
+        description: '要构建的目标，空格分隔'
+        required: true
+        default: 'ninfer-serve ninfer-calibrate'
+        type: string
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: ninfer-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: sm_${{ inputs.arch || '89' }} · Windows · CUDA 12.9
+    runs-on: windows-2022
+    # GitHub 托管运行器单个 job 的上限是 6 小时。冷启动（vcpkg 编 FFmpeg +
+    # 全量 nvcc）大概率在 1.5~3 小时之间，撞上限的概率不算低，见 README 里的对策。
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    env:
+      # vcpkg 二进制缓存挂在 GitHub Actions cache 上：第一次老老实实编，
+      # 之后同一个 key 直接命中，几分钟就过。
+      VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+      VCPKG_TARGET_TRIPLET: x64-windows
+      # cmake/GenerateBuildId.cmake 用它给二进制打号，省掉 git describe。
+      NINFER_BUILD_ID: ${{ github.sha }}
+
+    steps:
+      - name: Snapshot（磁盘 / 核心数 / 工具链）
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' |
+            Select-Object DeviceID,
+              @{n='FreeGB';e={[math]::Round($_.FreeSpace/1GB,1)}},
+              @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}} | Format-Table -AutoSize
+          "cores : $env:NUMBER_OF_PROCESSORS"
+          "image : $env:ImageOS"
+          (cmake --version)[0]
+          "ninja : $(ninja --version)"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      # ------------------------------------------------------------------
+      # CUDA Toolkit。ninfer_ops 链接了 CUDA::cublas，所以 nvcc / cudart /
+      # cublas 三个都不能少；cublas_dev 是头文件 + import lib 所在。
+      #
+      # 如果这一步报找不到某个子包，把 sub-packages 那三行删掉（装完整工具包，
+      # 多花几分钟和几个 GB 磁盘），或者换成下一步注释里的官方安装器。
+      # ------------------------------------------------------------------
+      - name: Install CUDA Toolkit 12.9.1
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.9.1'
+          method: 'network'
+          sub-packages: '["nvcc","cudart","cublas","cublas_dev"]'
+
+      # 官方安装器的等价写法（已验证链接可达，12.9.1 网络安装器约 16 MB）：
+      #
+      #   - name: Install CUDA Toolkit 12.9.1 (official installer)
+      #     shell: pwsh
+      #     run: |
+      #       $url = 'https://developer.download.nvidia.com/compute/cuda/12.9.1/network_installers/cuda_12.9.1_windows_network.exe'
+      #       Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\cuda_setup.exe"
+      #       $p = Start-Process -FilePath "$env:RUNNER_TEMP\cuda_setup.exe" `
+      #              -ArgumentList '-s','nvcc_12.9','cudart_12.9','cublas_12.9','cublas_dev_12.9' `
+      #              -Wait -PassThru
+      #       if ($p.ExitCode -ne 0) { throw "CUDA installer exit $($p.ExitCode)" }
+      #       "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: vcpkg — FFmpeg + curl
+        shell: pwsh
+        run: |
+          # 运行器镜像自带 vcpkg（VCPKG_INSTALLATION_ROOT）；没有就现拉一份。
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $root -or -not (Test-Path -LiteralPath "$root\.vcpkg-root")) {
+            $root = "$env:RUNNER_TEMP\vcpkg"
+            if (-not (Test-Path -LiteralPath "$root\.vcpkg-root")) {
+              git clone --depth 1 https://github.com/microsoft/vcpkg.git $root
+              if ($LASTEXITCODE -ne 0) { throw 'vcpkg clone failed' }
+            }
+          }
+          & "$root\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+
+          # 后续步骤和 cmake/FindFFMPEG.cmake 都要读这个环境变量。
+          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # [core,...] 是 vcpkg 里"关掉默认 feature"的写法；avutil 不是 feature，
+          # 它跟着 avcodec 一起出来。
+          & "$root\vcpkg.exe" install `
+              'ffmpeg[core,avcodec,avformat,swscale]:x64-windows' `
+              'curl:x64-windows'
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg install failed' }
+
+      # ------------------------------------------------------------------
+      # 把 VS 2022 (v143) 的环境导进当前 pwsh 进程。
+      # -version "[17.0,18.0)" 把 vswhere 锁在 VS 2022 上：即便镜像里后来装了
+      # VS 2026，也不会挑到 MSVC 14.5x 上去。
+      # vcvars64.bat 只往自己的 cmd 进程里写环境，所以跑完要把结果拷回来
+      # —— 和仓库自带 scripts/build.ps1 用的是同一招。
+      # ------------------------------------------------------------------
+      - name: Import the VS 2022 x64 build environment
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version '[17.0,18.0)' `
+                  -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                  -property installationPath
+          if (-not $vs) { throw 'no Visual Studio 2022 (17.x) with the x64 toolset on this image' }
+          "VS     : $vs"
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2] }
+          }
+          # 打印出来，万一挂了这就是证据：路径里必须是 14.4x 而不是 14.5x。
+          "cl.exe : $((Get-Command cl.exe).Source)"
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version | Select-Object -Last 2
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja `
+            '-DCMAKE_BUILD_TYPE=Release' `
+            "-DCMAKE_CUDA_ARCHITECTURES=${{ inputs.arch || '89' }}" `
+            "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH\bin\nvcc.exe" `
+            '-DNINFER_BUILD_APPS=ON' `
+            '-DBUILD_TESTING=OFF' `
+            '-DNINFER_BUILD_BENCHMARKS=OFF'
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed ($LASTEXITCODE)" }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $raw = '${{ inputs.targets }}'
+          if (-not $raw) { $raw = 'ninfer-serve ninfer-calibrate' }
+          $targets = $raw.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+          cmake --build build --target @targets
+          if ($LASTEXITCODE -ne 0) { throw "cmake --build failed ($LASTEXITCODE)" }
+
+      - name: Collect the executables
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Path build\apps\*.exe -Destination dist\ -Force
+          if ($LASTEXITCODE -ne 0) { throw 'no executables under build\apps' }
+          # FFmpeg / curl 的 DLL，由 ninfer_stage_runtime_dlls() 拷过来的。
+          $dlls = Get-ChildItem -Path build\apps -Filter *.dll -ErrorAction SilentlyContinue
+          if ($dlls) { Copy-Item -Path $dlls.FullName -Destination dist\ -Force }
+          Get-ChildItem dist |
+            Select-Object Name,@{n='MB';e={[math]::Round($_.Length/1MB,1)}} |
+            Format-Table -AutoSize
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ninfer-windows-sm${{ inputs.arch || '89' }}
+          path: dist/
+          # 每个 exe 都带着约 0.5 GB 的 kernel image，两个就 1 GB 出头。
+          # 免费仓库的 Actions 存储只有 500 MB，artifact 存不下 —— 打 tag 时
+          # 走下面的 release 更稳，artifact 只留 1 天当临时交付。
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
