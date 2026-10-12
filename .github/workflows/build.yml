@@ -1,0 +1,52 @@
+name: Build ninfer-all for RTX 4090
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  build-windows-cuda:
+    runs-on: windows-latest # 使用最新的 Windows 运行器
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 安装 CUDA Toolkit
+      uses: mjun0812/setup-cuda@v1
+      with:
+        # 项目要求 CUDA 13.1 或更新版本
+        version: '13.1'
+
+    - name: 安装 CMake
+      uses: lukka/get-cmake@latest
+      with:
+        # 项目要求 CMake 3.28 或更高版本
+        cmakeVersion: '3.28.0'
+
+    - name: 安装 Ninja
+      run: choco install ninja -y
+
+    - name: 配置项目
+      shell: cmd
+      # 使用 vcvarsall.bat 初始化 MSVC 环境，这是编译 CUDA 所必需的
+      run: |
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+        cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
+
+    - name: 编译项目
+      shell: cmd
+      run: |
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+        cmake --build build --config Release
+
+    - name: 上传构建产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: ninfer-all-rtx4090-build
+        path: build/
+        # 可根据需要排除不必要的文件
+        # 例如: !build/CMakeFiles/**
