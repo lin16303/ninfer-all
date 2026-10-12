@@ -1,27 +1,11 @@
 {
   "name": "ninfer-all CUDA Dev",
   "image": "nvidia/cuda:13.1.1-devel-ubuntu24.04",
-  "hostRequirements": {
-    "gpu": "optional"
-  },
-  "containerEnv": {
-    "NVIDIA_VISIBLE_DEVICES": "all"
-  },
-  "runArgs": [
-    "--gpus", "all"
-  ],
+  "runArgs": ["--gpus", "all"],
   "features": {
     "ghcr.io/devcontainers/features/cmake:1": {},
     "ghcr.io/devcontainers/features/ninja:1": {},
     "ghcr.io/devcontainers/features/git:1": {}
   },
-  "postCreateCommand": "bash .devcontainer/setup.sh",
-  "customizations": {
-    "vscode": {
-      "extensions": [
-        "ms-vscode.cpptools",
-        "ms-vscode.cmake-tools"
-      ]
-    }
-  }
+  "postCreateCommand": "bash .devcontainer/setup.sh"
 }
